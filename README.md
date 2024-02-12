@@ -8,7 +8,7 @@ Changes and additions:
 - Parallelized phasevocoding and fading
 
 May add in the future:
-- Voice recognition and By-Voice Cutting mode (eg. to avoid background music or audio to prevent cuts where wanted)
+- Voice recognition and By-Voice Cutting mode (eg. to avoid background music or audio preventing speedups where wanted)
 
 ## Installing dependencies
 To install the python libaries this script depends on, simply run `pip install requirements.txt`.
