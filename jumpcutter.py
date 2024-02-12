@@ -5,6 +5,7 @@ from scipy.io import wavfile
 from shutil import rmtree
 from tqdm import tqdm as std_tqdm
 from functools import partial
+from multiprocessing import Pool, Array
 import numpy as np
 import subprocess
 import argparse
@@ -117,17 +118,56 @@ def _get_tree_expression_rec(chunks) -> str:
         offset = - chunk[0] * local_speedup + chunk[2]
         return 'N*{}{:+}'.format(local_speedup, offset)
 
+def _get_shared_audio_data():
+    global shared_audio_buffer
+    return np.frombuffer(shared_audio_buffer[0], dtype=shared_audio_buffer[1]).reshape(shared_audio_buffer[2])
+
+def _init_shared_audio_data(audio):
+    global shared_audio_buffer
+    
+    shared_audio_buffer = (
+        Array(np.ctypeslib.as_ctypes_type(audio.dtype), audio.shape[0] * audio.shape[1], lock=False),
+        audio.dtype,
+        audio.shape
+    )
+
+    audio_buffer = _get_shared_audio_data()
+
+    np.copyto(audio_buffer, audio)
+    return audio_buffer
+
+def _process_chunk(chunk):
+        samples_per_frame, new_speeds, audio_fade_envelope_size = chunk[3:6]
+        audio_chunk = _get_shared_audio_data()[int(chunk[0] * samples_per_frame):int(chunk[1] * samples_per_frame)]
+
+        reader = ArrayReader(np.transpose(audio_chunk))
+        writer = ArrayWriter(reader.channels)
+        tsm = phasevocoder(reader.channels, speed=new_speeds[int(chunk[2])])
+        tsm.run(reader, writer)
+        altered_audio_data = np.transpose(writer.data)
+
+        # smooth out transition's audio by quickly fading in/out
+        if altered_audio_data.shape[0] < audio_fade_envelope_size:
+            altered_audio_data[:] = 0  # audio is less than 0.01 sec, let's just remove it.
+        else:
+            premask = np.arange(audio_fade_envelope_size) / audio_fade_envelope_size
+            mask = np.repeat(premask[:, np.newaxis], 2, axis=1)  # make the fade-envelope mask stereo
+            altered_audio_data[:audio_fade_envelope_size] *= mask
+            altered_audio_data[-audio_fade_envelope_size:] *= 1 - mask
+        
+        return altered_audio_data
 
 def speed_up_video(
         input_file: str,
         output_file: str = None,
-        frame_rate: float = 30,
+        frame_rate: float = None,
         sample_rate: int = 44100,
         silent_threshold: float = 0.03,
         silent_speed: float = 5.0,
         sounded_speed: float = 1.0,
         frame_spreadage: int = 1,
         audio_fade_envelope_size: int = 400,
+        threads_num: int = None,
         temp_folder: str = 'TEMP') -> None:
     """
     Speeds up a video file with different speeds for the silent and loud sections in the video.
@@ -142,6 +182,7 @@ def speed_up_video(
     :param sounded_speed: The speed of the loud chunks.
     :param frame_spreadage: How many silent frames adjacent to sounded frames should be included to provide context.
     :param audio_fade_envelope_size: Audio transition smoothing duration in samples.
+    :param threads_num: Number of threads used for phasevocoding step. By default equal to the number of hardware threads.
     :param temp_folder: The file path of the temporary working folder.
     """
     # Set output file name based on input file name if none was given
@@ -164,6 +205,10 @@ def speed_up_video(
     if match_frame_rate is not None:
         frame_rate = float(match_frame_rate.group(1)) / float(match_frame_rate.group(2))
         # print(f'Found Framerate {frame_rate}')
+    
+    if frame_rate is None:
+        print("\033[93;40mWARNING\033[0m: Failed to detect frame rate and --frame_rate argument was not passed, assuming 30 fps. If your output has desynced audio, this is why!!!")
+        frame_rate = 30
 
     match_duration = re.search(r'duration=([\d.]*)', str(std_out))
     original_duration = 0.0
@@ -185,6 +230,9 @@ def speed_up_video(
                               desc='Extracting audio:')
 
     wav_sample_rate, audio_data = wavfile.read(temp_folder + "/audio.wav")
+
+    audio_data = _init_shared_audio_data(audio_data)
+
     audio_sample_count = audio_data.shape[0]
     max_audio_volume = _get_max_volume(audio_data)
     samples_per_frame = wav_sample_rate / frame_rate
@@ -202,6 +250,7 @@ def speed_up_video(
             has_loud_audio[i] = True
 
     # Chunk the frames together that are quiet or loud
+    new_speeds = [silent_speed, sounded_speed]
     chunks = [[0, 0, 0]]
     should_include_frame = np.zeros(audio_frame_count, dtype=bool)
     for i in tqdm(range(audio_frame_count), desc='Finding chunks:', unit='frames'):
@@ -209,46 +258,33 @@ def speed_up_video(
         end = int(min(audio_frame_count, i + 1 + frame_spreadage))
         should_include_frame[i] = np.any(has_loud_audio[start:end])
         if i >= 1 and should_include_frame[i] != should_include_frame[i - 1]:  # Did we flip?
-            chunks.append([chunks[-1][1], i, should_include_frame[i - 1]])
+            chunks.append([chunks[-1][1], i, should_include_frame[i - 1], samples_per_frame, new_speeds, audio_fade_envelope_size])
 
-    chunks.append([chunks[-1][1], audio_frame_count, should_include_frame[audio_frame_count - 1]])
+    chunks.append([chunks[-1][1], audio_frame_count, should_include_frame[audio_frame_count - 1], samples_per_frame, new_speeds, audio_fade_envelope_size])
     chunks = chunks[1:]
 
     # Generate audio data with varying speed for each chunk
-    new_speeds = [silent_speed, sounded_speed]
+    output_audio_data = np.zeros(audio_data.shape, dtype=audio_data.dtype)
     output_pointer = 0
-    audio_buffers = []
-    for index, chunk in tqdm(enumerate(chunks), total=len(chunks), desc='Changing audio:', unit='chunks'):
-        audio_chunk = audio_data[int(chunk[0] * samples_per_frame):int(chunk[1] * samples_per_frame)]
 
-        reader = ArrayReader(np.transpose(audio_chunk))
-        writer = ArrayWriter(reader.channels)
-        tsm = phasevocoder(reader.channels, speed=new_speeds[int(chunk[2])])
-        tsm.run(reader, writer)
-        altered_audio_data = np.transpose(writer.data)
+    p = Pool(threads_num)
+    processed_chunks = p.imap(_process_chunk, chunks, chunksize=64)
 
-        # smooth out transition's audio by quickly fading in/out
-        if altered_audio_data.shape[0] < audio_fade_envelope_size:
-            altered_audio_data[:] = 0  # audio is less than 0.01 sec, let's just remove it.
-        else:
-            premask = np.arange(audio_fade_envelope_size) / audio_fade_envelope_size
-            mask = np.repeat(premask[:, np.newaxis], 2, axis=1)  # make the fade-envelope mask stereo
-            altered_audio_data[:audio_fade_envelope_size] *= mask
-            altered_audio_data[-audio_fade_envelope_size:] *= 1 - mask
-
-        audio_buffers.append(altered_audio_data / max_audio_volume)
-
+    for index, altered_audio_data in tqdm(enumerate(processed_chunks), total=len(chunks), desc='Phasevocoding audio:', unit='chunks'):
         end_pointer = output_pointer + altered_audio_data.shape[0]
+
+        output_audio_data[output_pointer:end_pointer] = altered_audio_data # / max_audio_volume
+
         start_output_frame = int(math.ceil(output_pointer / samples_per_frame))
         end_output_frame = int(math.ceil(end_pointer / samples_per_frame))
-        chunks[index] = chunk[:2] + [start_output_frame, end_output_frame]
+        chunks[index] = chunks[index][:2] + [start_output_frame, end_output_frame]
 
         output_pointer = end_pointer
 
-    # print(chunks)
-
-    output_audio_data = np.concatenate(audio_buffers)
     wavfile.write(temp_folder + "/audioNew.wav", sample_rate, output_audio_data)
+
+    del output_audio_data
+    del p
 
     # Cut the video parts to length
     expression = _get_tree_expression(chunks)
@@ -304,6 +340,9 @@ if __name__ == '__main__':
     parser.add_argument('-fr', '--frame_rate', type=float, dest='frame_rate',
                         help="Frame rate of the input and output videos. FFmpeg tries to extract this information."
                              " Thus only needed if FFmpeg fails to do so.")
+    parser.add_argument('-j', '--jobs', type=int, dest='threads_num',
+                        help="Number of threads used for phasevocoding the audio."
+                        " By default equal to the number of hardware threads in your computer.")
 
     files = []
     for input_file in parser.parse_args().input_file:
