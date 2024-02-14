@@ -17,7 +17,7 @@ import time
 FFMPEG_PATH = 'ffmpeg'
 
 tqdm = partial(std_tqdm,
-               bar_format=('{desc:<20} {percentage:3.0f}%'
+               bar_format=('{desc:<22} {percentage:3.0f}%'
                            '|{bar:10}|'
                            ' {n_fmt:>6}/{total_fmt:>6} [{elapsed:^5}<{remaining:^5}, {rate_fmt}{postfix}]'))
 # tqdm = std_tqdm
@@ -270,7 +270,7 @@ def speed_up_video(
     p = Pool(threads_num)
     processed_chunks = p.imap(_process_chunk, chunks, chunksize=64)
 
-    for index, altered_audio_data in tqdm(enumerate(processed_chunks), total=len(chunks), desc='Phasevocoding audio:', unit='chunks'):
+    for index, altered_audio_data in tqdm(enumerate(processed_chunks), total=len(chunks), desc='Phasevocoding chunks:', unit='chunks'):
         end_pointer = output_pointer + altered_audio_data.shape[0]
 
         output_audio_data[output_pointer:end_pointer] = altered_audio_data # / max_audio_volume
@@ -302,6 +302,7 @@ def speed_up_video(
         '-map', '-0:a',
         '-map', '1:a',
         '-c:a', 'aac',
+        '-t', str(chunks[-1][3] / frame_rate), # fix incorrect video duration
         output_file,
         '-loglevel', 'warning',
         '-stats',
