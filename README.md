@@ -6,9 +6,10 @@ This fork is just a few optimalizations added to the already quite fast Gerell's
 Changes and additions:
 - Descresed Memory Usage by using an Shared Audio Buffers
 - Parallelized phasevocoding and fading
+- Voice Activity Detector (WebRTC) support for removing non-voice audio (must enable in flags)
 
 May add in the future:
-- Voice recognition and By-Voice Cutting mode (eg. to avoid background music or audio preventing speedups where wanted)
+- Smarter (and possibly slower) VAD which can separate and ignore background music and noise.
 
 ## Installing dependencies
 To install the python libaries this script depends on, simply run `pip install requirements.txt`.
