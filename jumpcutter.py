@@ -161,10 +161,12 @@ def speed_up_video(
         input_file: str,
         output_file: str = None,
         frame_rate: float = None,
-        sample_rate: int = 44100,
-        silent_threshold: float = 0.03,
+        sample_rate: int = 48000,
         silent_speed: float = 5.0,
         sounded_speed: float = 1.0,
+        threshold_method: str = None,
+        silent_threshold: float = 0.03,
+        webrtc_mode: int = 1,
         frame_spreadage: int = 1,
         audio_fade_envelope_size: int = 400,
         threads_num: int = None,
@@ -176,8 +178,10 @@ def speed_up_video(
     :param output_file: The file name of the output file. If not given will be 'input_file'_ALTERED.ext.
     :param frame_rate: The frame rate of the given video. Only needed if not extractable through ffmpeg.
     :param sample_rate: The sample rate of the audio in the video.
+    :param threshold_method: The method used for separating sounded and silent frames
     :param silent_threshold: The threshold when a chunk counts towards being a silent chunk.
                              Value ranges from 0 (nothing) - 1 (max volume).
+    :param webrtc_mode: mode used for the Webrtc VAD, sets how aggressivelly it removes non-voice audio
     :param silent_speed: The speed of the silent chunks.
     :param sounded_speed: The speed of the loud chunks.
     :param frame_spreadage: How many silent frames adjacent to sounded frames should be included to provide context.
@@ -241,13 +245,58 @@ def speed_up_video(
     # Find frames with loud audio
     has_loud_audio = np.zeros(audio_frame_count, dtype=bool)
 
-    for i in range(audio_frame_count):
+    if threshold_method == None:
+        threshold_method = "silence"
+
+    threshold_methods = {
+        "silence": 0,
+        "webrtc-voice": 1
+    }
+
+    threshold_index = threshold_methods[threshold_method]
+
+    webvad = None
+    webvad_length = 0
+    if threshold_index == 1:
+        try:
+            import webrtcvad
+        except ImportError:
+            print("Selected webrtc-voice as a threshold method without installing the required webrtcvad module!")
+            quit(-1)
+
+        webvad = webrtcvad.Vad(webrtc_mode)
+        
+        # webrtc vad only supports 10, 20 or 30 ms audio chunks so we need to pick the biggest audio size which fits inside our audio frame
+        if samples_per_frame > int(sample_rate * 0.03):
+            webvad_length = int(sample_rate * 0.03)
+        elif samples_per_frame > int(sample_rate * 0.02):
+            webvad_length = int(sample_rate * 0.02)
+        elif samples_per_frame > int(sample_rate * 0.01):
+            webvad_length = int(sample_rate * 0.01)
+        else:
+            print("Too high frame rate for webrtc to handle! frame time must be at least 10 ms.")
+            quit(-1)
+
+    for i in tqdm(range(audio_frame_count), desc="Thresholding audio:", unit='frames'):
         start = int(i * samples_per_frame)
         end = min(int((i + 1) * samples_per_frame), audio_sample_count)
         audio_chunk = audio_data[start:end]
-        chunk_max_volume = float(_get_max_volume(audio_chunk)) / max_audio_volume
-        if chunk_max_volume >= silent_threshold:
-            has_loud_audio[i] = True
+
+        if threshold_index == 0: # silence method
+            chunk_max_volume = float(_get_max_volume(audio_chunk)) / max_audio_volume
+            has_loud_audio[i] = chunk_max_volume >= silent_threshold
+        elif threshold_index == 1: # webrtc-voice method
+            try:
+                if len(audio_chunk) < webvad_length: # end of audio file, not enough samples, skip as silent
+                    has_loud_audio[i] = False
+                    continue
+
+                # note: webrtc only accepts mono, only scans for left channel
+                has_loud_audio[i] = webvad.is_speech(audio_chunk[:, 0].tobytes(order='C'), sample_rate, webvad_length)
+
+            except:
+                print("\033[93;40mWARNING\033[0m: Webrtc Vad failed! Webrtc only supports 8000, 16000, 32000 or 48000 Hz sample rate, make sure you set your sample_rate accordingly.")
+                raise
 
     # Chunk the frames together that are quiet or loud
     new_speeds = [silent_speed, sounded_speed]
@@ -325,13 +374,19 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output_file', type=str, dest='output_file',
                         help="The output file. Only usable if a single file is given."
                              " If not included, it'll just modify the input file name by adding _ALTERED.")
-    parser.add_argument('-t', '--silent_threshold', type=float, dest='silent_threshold',
-                        help='The volume amount that frames\' audio needs to surpass to be consider "sounded".'
-                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03')
     parser.add_argument('-S', '--sounded_speed', type=float, dest='sounded_speed',
                         help="The speed that sounded (spoken) frames should be played at. Defaults to 1.")
     parser.add_argument('-s', '--silent_speed', type=float, dest='silent_speed',
                         help="The speed that silent frames should be played at. Defaults to 5")
+    parser.add_argument('-tm', '--threshold_method', type=str, dest='threshold_method',
+                        help="Thresholding method used for determining if an audio is sounded or silent."
+                        " Currently support \"silence\" (default) and \"webrtc-voice\" (requires webrtcvad module) modes.")
+    parser.add_argument('-t', '--silent_threshold', type=float, dest='silent_threshold',
+                        help='The volume amount that frames\' audio needs to surpass to be consider "sounded".'
+                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03 (silence method only)')
+    parser.add_argument('-va', '--voice-aggressiveness-mode', type=int, dest='webrtc_mode',
+                        help="Voice Activity Detection aggresiveness mode. Sets how aggresive is the voice detector about determining if a voice is present."
+                        " Must be between 0 and 3. 0 is least aggresive about filtering non-speech, 3 is the most aggresive. Defaults to 1. (webrtc-voice method only)")
     parser.add_argument('-fm', '--frame_margin', type=float, dest='frame_spreadage',
                         help="Some silent frames adjacent to sounded frames are included to provide context."
                              " This is how many frames on either the side of speech should be included. Defaults to 1")
