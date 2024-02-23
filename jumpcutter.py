@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 from audiotsm import phasevocoder
 from audiotsm.io.array import ArrayReader, ArrayWriter
-from scipy.io import wavfile
+import soundfile as sf
 from shutil import rmtree
 from tqdm import tqdm as std_tqdm
 from functools import partial
@@ -136,6 +136,39 @@ def _init_shared_audio_data(audio):
     np.copyto(audio_buffer, audio)
     return audio_buffer
 
+def _preprocess_filter_vocals(chunk):
+    import librosa
+
+    audio_buf = librosa.util.buf_to_float(_get_shared_audio_data()[chunk[0]:chunk[0]+chunk[1], 0].copy(order='C'), n_bytes=2)
+    # audio_buf = librosa.to_mono(audio_buf)
+
+    S_full, phase = librosa.magphase(librosa.stft(audio_buf))
+
+    S_filter = librosa.decompose.nn_filter(S_full,
+                                       aggregate=np.median,
+                                       metric='cosine',
+                                       width=int(librosa.time_to_frames(2, sr=chunk[2])))
+    
+    S_filter = np.minimum(S_full, S_filter)
+
+    margin_i, margin_v = 2, 10
+    power = 2
+
+    mask_i = librosa.util.softmask(S_filter,
+                                   margin_i * (S_full - S_filter),
+                                   power=power)
+
+    mask_v = librosa.util.softmask(S_full - S_filter,
+                                   margin_v * S_filter,
+                                   power=power)
+
+    S_foreground = mask_v * S_full
+    # S_background = mask_i * S_full
+
+    audio_buf_filtered = librosa.istft(S_foreground * phase)
+
+    return audio_buf_filtered
+
 def _process_chunk(chunk):
         samples_per_frame, new_speeds, audio_fade_envelope_size = chunk[3:6]
         audio_chunk = _get_shared_audio_data()[int(chunk[0] * samples_per_frame):int(chunk[1] * samples_per_frame)]
@@ -162,6 +195,7 @@ def speed_up_video(
         output_file: str = None,
         frame_rate: float = None,
         sample_rate: int = 48000,
+        enable_librosa: bool = False,
         silent_speed: float = 5.0,
         sounded_speed: float = 1.0,
         threshold_method: str = None,
@@ -169,6 +203,7 @@ def speed_up_video(
         webrtc_mode: int = 1,
         frame_spreadage: int = 1,
         audio_fade_envelope_size: int = 400,
+        librosa_preprocess: list = [],
         threads_num: int = None,
         temp_folder: str = 'TEMP') -> None:
     """
@@ -233,7 +268,7 @@ def speed_up_video(
     _run_timed_ffmpeg_command(command, total=int(original_duration * frame_rate), unit='frames',
                               desc='Extracting audio:')
 
-    wav_sample_rate, audio_data = wavfile.read(temp_folder + "/audio.wav")
+    audio_data, wav_sample_rate = sf.read(temp_folder + "/audio.wav", dtype='int16')
 
     audio_data = _init_shared_audio_data(audio_data)
 
@@ -241,6 +276,39 @@ def speed_up_video(
     max_audio_volume = _get_max_volume(audio_data)
     samples_per_frame = wav_sample_rate / frame_rate
     audio_frame_count = int(math.ceil(audio_sample_count / samples_per_frame))
+
+    # Preprocess using librosa
+
+    preprocessed_audio_buffer = None
+
+    if enable_librosa:
+        try:
+            import librosa
+        except ImportError:
+            print("Enabled librosa advanced audio processing without installing the required librosa module!")
+            raise
+
+        p = Pool(threads_num)
+
+        preprocessed_audio_buffer = np.zeros((audio_data.shape[0],), dtype=audio_data.dtype)
+        preprocessed_pointer = 0
+        
+        chunk_size = 10 * sample_rate # 10s of audio
+
+        if "filter-vocals" in librosa_preprocess:
+            chunk_begin = 0
+            in_chunks = []
+
+            while chunk_begin < audio_sample_count:
+                in_chunks.append((chunk_begin, chunk_size, sample_rate))
+                
+                chunk_begin += chunk_size
+
+            for chunk in tqdm(p.imap(_preprocess_filter_vocals, in_chunks), desc="Filtering Vocals:", unit="chunks", total=len(in_chunks)):
+                preprocessed_audio_buffer[preprocessed_pointer:preprocessed_pointer + chunk.shape[0]] = chunk * np.iinfo(preprocessed_audio_buffer.dtype).max
+                preprocessed_pointer += chunk.shape[0]
+    else:
+        preprocessed_audio_buffer = audio_data
 
     # Find frames with loud audio
     has_loud_audio = np.zeros(audio_frame_count, dtype=bool)
@@ -280,7 +348,7 @@ def speed_up_video(
     for i in tqdm(range(audio_frame_count), desc="Thresholding audio:", unit='frames'):
         start = int(i * samples_per_frame)
         end = min(int((i + 1) * samples_per_frame), audio_sample_count)
-        audio_chunk = audio_data[start:end]
+        audio_chunk = preprocessed_audio_buffer[start:end]
 
         if threshold_index == 0: # silence method
             chunk_max_volume = float(_get_max_volume(audio_chunk)) / max_audio_volume
@@ -292,11 +360,13 @@ def speed_up_video(
                     continue
 
                 # note: webrtc only accepts mono, only scans for left channel
-                has_loud_audio[i] = webvad.is_speech(audio_chunk[:, 0].tobytes(order='C'), sample_rate, webvad_length)
+                has_loud_audio[i] = webvad.is_speech(audio_chunk.tobytes(order='C'), sample_rate, webvad_length)
 
             except:
-                print("\033[93;40mWARNING\033[0m: Webrtc Vad failed! Webrtc only supports 8000, 16000, 32000 or 48000 Hz sample rate, make sure you set your sample_rate accordingly.")
+                print("\033[93;40mWARNING\033[0m: Webrtc Vad failed! Webrtc only supports 8000, 16000, 32000 or 48000 Hz sample rate, make sure you set your sample_rate argument accordingly.")
                 raise
+
+    del preprocessed_audio_buffer
 
     # Chunk the frames together that are quiet or loud
     new_speeds = [silent_speed, sounded_speed]
@@ -330,7 +400,12 @@ def speed_up_video(
 
         output_pointer = end_pointer
 
-    wavfile.write(temp_folder + "/audioNew.wav", sample_rate, output_audio_data)
+    # Postprocess using librosa
+
+    if enable_librosa:
+        pass
+
+    sf.write(temp_folder + "/audioNew.wav", output_audio_data, sample_rate)
 
     del output_audio_data
     del p
@@ -374,31 +449,46 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output_file', type=str, dest='output_file',
                         help="The output file. Only usable if a single file is given."
                              " If not included, it'll just modify the input file name by adding _ALTERED.")
-    parser.add_argument('-S', '--sounded_speed', type=float, dest='sounded_speed',
-                        help="The speed that sounded (spoken) frames should be played at. Defaults to 1.")
-    parser.add_argument('-s', '--silent_speed', type=float, dest='silent_speed',
-                        help="The speed that silent frames should be played at. Defaults to 5")
-    parser.add_argument('-tm', '--threshold_method', type=str, dest='threshold_method',
-                        help="Thresholding method used for determining if an audio is sounded or silent."
-                        " Currently support \"silence\" (default) and \"webrtc-voice\" (requires webrtcvad module) modes.")
-    parser.add_argument('-t', '--silent_threshold', type=float, dest='silent_threshold',
-                        help='The volume amount that frames\' audio needs to surpass to be consider "sounded".'
-                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03 (silence method only)')
-    parser.add_argument('-va', '--voice-aggressiveness-mode', type=int, dest='webrtc_mode',
-                        help="Voice Activity Detection aggresiveness mode. Sets how aggresive is the voice detector about determining if a voice is present."
-                        " Must be between 0 and 3. 0 is least aggresive about filtering non-speech, 3 is the most aggresive. Defaults to 1. (webrtc-voice method only)")
-    parser.add_argument('-fm', '--frame_margin', type=float, dest='frame_spreadage',
-                        help="Some silent frames adjacent to sounded frames are included to provide context."
-                             " This is how many frames on either the side of speech should be included. Defaults to 1")
-    parser.add_argument('-sr', '--sample_rate', type=float, dest='sample_rate',
-                        help="Sample rate of the input and output videos. FFmpeg tries to extract this information."
-                             " Thus only needed if FFmpeg fails to do so.")
-    parser.add_argument('-fr', '--frame_rate', type=float, dest='frame_rate',
-                        help="Frame rate of the input and output videos. FFmpeg tries to extract this information."
-                             " Thus only needed if FFmpeg fails to do so.")
     parser.add_argument('-j', '--jobs', type=int, dest='threads_num',
                         help="Number of threads used for phasevocoding the audio."
                         " By default equal to the number of hardware threads in your computer.")
+
+    common_group = parser.add_argument_group('common audio options')
+
+    common_group.add_argument('-S', '--sounded_speed', type=float, dest='sounded_speed',
+                        help="The speed that sounded (spoken) frames should be played at. Defaults to 1.")
+    common_group.add_argument('-s', '--silent_speed', type=float, dest='silent_speed',
+                        help="The speed that silent frames should be played at. Defaults to 5")
+    common_group.add_argument('-fm', '--frame_margin', type=float, dest='frame_spreadage',
+                        help="Some silent frames adjacent to sounded frames are included to provide context."
+                             " This is how many frames on either the side of speech should be included. Defaults to 1")
+    common_group.add_argument('-sr', '--sample_rate', type=float, dest='sample_rate',
+                        help="Sample rate of the input and output videos. FFmpeg tries to extract this information."
+                             " Thus only needed if FFmpeg fails to do so.")
+    common_group.add_argument('-fr', '--frame_rate', type=float, dest='frame_rate',
+                        help="Frame rate of the input and output videos. FFmpeg tries to extract this information."
+                             " Thus only needed if FFmpeg fails to do so.")
+    common_group.add_argument('-r', '--librosa', dest='enable_librosa', action='store_true',
+                        help="Enables advanced librosa based audio processing."
+                        " See the librosa help section for librosa specific options. (requires librosa module)")
+    
+    threshold_arguments = parser.add_argument_group('audio thresholding options')
+
+    threshold_arguments.add_argument('-tm', '--threshold_method', type=str, dest='threshold_method',
+                        help="Thresholding method used for determining if an audio is sounded or silent."
+                        " Currently support \"silence\" (default) and \"webrtc-voice\" (requires webrtcvad module) modes.")
+    threshold_arguments.add_argument('-t', '--silent_threshold', type=float, dest='silent_threshold',
+                        help='The volume amount that frames\' audio needs to surpass to be consider "sounded".'
+                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03 (silence method only)')
+    threshold_arguments.add_argument('-va', '--voice-aggressiveness-mode', type=int, dest='webrtc_mode',
+                        help="Voice Activity Detection aggresiveness mode. Sets how aggresive is the voice detector about determining if a voice is present."
+                        " Must be between 0 and 3. 0 is least aggresive about filtering non-speech, 3 is the most aggresive. Defaults to 1. (webrtc-voice method only)")
+    
+    librosa_group = parser.add_argument_group('librosa options')
+
+    librosa_group.add_argument('-pre', '--pre_process', type=str, action='append', dest='librosa_preprocess',
+                        help="Set what preprocessing stages are enabled before thresholding audio."
+                        " Currently supported stage is only \"filter-vocals\" and \"enhance-vocals\"")
 
     files = []
     for input_file in parser.parse_args().input_file:
@@ -408,6 +498,7 @@ if __name__ == '__main__':
             files += [os.path.join(input_file, file) for file in os.listdir(input_file)]
 
     args = {k: v for k, v in vars(parser.parse_args()).items() if v is not None}
+
     del args['input_file']
     if len(files) > 1 and 'output_file' in args:
         del args['output_file']

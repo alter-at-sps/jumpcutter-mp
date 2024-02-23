@@ -1,4 +1,4 @@
 audiotsm
-scipy
+soundfile
 numpy
 tqdm
