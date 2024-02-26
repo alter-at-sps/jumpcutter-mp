@@ -57,6 +57,9 @@ def _input_to_output_filename(filename):
     dot_index = filename.rfind(".")
     return filename[:dot_index] + "_ALTERED" + filename[dot_index:]
 
+def _input_to_cache_filename(filename):
+    dot_index = filename.rfind(".")
+    return filename[:dot_index] + "_cached_track.wav"
 
 def _create_path(s):
     # assert (not os.path.exists(s)), "The filepath "+s+" already exists. Don't want to overwrite it. Aborting."
@@ -205,7 +208,9 @@ def speed_up_video(
         audio_fade_envelope_size: int = 400,
         librosa_preprocess: list = [],
         threads_num: int = None,
-        temp_folder: str = 'TEMP') -> None:
+        enable_cache: bool = False,
+        cache_dir: str = "jump-cache",
+        temp_dir: str = "jump-temp") -> None:
     """
     Speeds up a video file with different speeds for the silent and loud sections in the video.
 
@@ -222,16 +227,17 @@ def speed_up_video(
     :param frame_spreadage: How many silent frames adjacent to sounded frames should be included to provide context.
     :param audio_fade_envelope_size: Audio transition smoothing duration in samples.
     :param threads_num: Number of threads used for phasevocoding step. By default equal to the number of hardware threads.
-    :param temp_folder: The file path of the temporary working folder.
+    :param temp_dir: The file path of the temporary working folder.
+    :param enable_cache: Enables caching of the preprocessed threshold audio track
     """
     # Set output file name based on input file name if none was given
     if output_file is None:
         output_file = _input_to_output_filename(input_file)
 
     # Create Temp Folder
-    if os.path.exists(temp_folder):
-        _delete_path(temp_folder)
-    _create_path(temp_folder)
+    if os.path.exists(temp_dir):
+        _delete_path(temp_dir)
+    _create_path(temp_dir)
 
     # Find out framerate and duration of the input video
     command = [
@@ -261,14 +267,14 @@ def speed_up_video(
         '-ab', '160k',
         '-ac', '2',
         '-ar', str(sample_rate),
-        '-vn', temp_folder + '/audio.wav',
+        '-vn', temp_dir + '/audio.wav',
         '-hide_banner'
     ]
 
     _run_timed_ffmpeg_command(command, total=int(original_duration * frame_rate), unit='frames',
                               desc='Extracting audio:')
 
-    audio_data, wav_sample_rate = sf.read(temp_folder + "/audio.wav", dtype='int16')
+    audio_data, wav_sample_rate = sf.read(temp_dir + "/audio.wav", dtype='int16')
 
     audio_data = _init_shared_audio_data(audio_data)
 
@@ -277,47 +283,76 @@ def speed_up_video(
     samples_per_frame = wav_sample_rate / frame_rate
     audio_frame_count = int(math.ceil(audio_sample_count / samples_per_frame))
 
-    # Preprocess using librosa
+    # Preprocess thershold audio track
 
     preprocessed_audio_buffer = None
+    loaded_cached = False
 
-    if enable_librosa:
-        try:
-            import librosa
-        except ImportError:
-            print("Enabled librosa advanced audio processing without installing the required librosa module!")
-            raise
-
-        p = Pool(threads_num)
-
-        preprocessed_audio_buffer = np.zeros((audio_data.shape[0],), dtype=audio_data.dtype)
-        preprocessed_pointer = 0
+    if enable_cache:
+        if not os.path.exists(cache_dir):
+            _create_path(cache_dir)
         
-        chunk_size = 10 * sample_rate # 10s of audio
+        cache_file = _input_to_cache_filename(os.path.basename(input_file))
 
-        if "filter-vocals" in librosa_preprocess:
-            chunk_begin = 0
-            in_chunks = []
+        if os.path.exists(cache_dir + "/" + cache_file):
+            print(f"Loading cached file \'{cache_file}\'")
+            loaded_cached = True
 
-            while chunk_begin < audio_sample_count:
-                in_chunks.append((chunk_begin, chunk_size, sample_rate))
-                
-                chunk_begin += chunk_size
+            preprocessed_audio_buffer, cache_sample_rate = sf.read(cache_dir + "/" + cache_file, dtype='int16')
 
-            for chunk in tqdm(p.imap(_preprocess_filter_vocals, in_chunks), desc="Filtering Vocals:", unit="chunks", total=len(in_chunks)):
-                preprocessed_audio_buffer[preprocessed_pointer:preprocessed_pointer + chunk.shape[0]] = chunk * np.iinfo(preprocessed_audio_buffer.dtype).max
-                preprocessed_pointer += chunk.shape[0]
-    else:
-        preprocessed_audio_buffer = audio_data
+            if not sample_rate == cache_sample_rate:
+                print("\033[93;40mWARNING\033[0m: The sample rate changed from the sample rate of the cached audio track, reextracting!")
+
+                preprocessed_audio_buffer = None
+                loaded_cached = False
+    
+    if loaded_cached == False:
+        if enable_librosa:
+            try:
+                import librosa
+            except ImportError:
+                print("\033[93;40mWARNING\033[0m: Enabled librosa advanced audio processing without installing the required librosa module!")
+                raise
+
+            p = Pool(threads_num)
+
+            preprocessed_audio_buffer = np.zeros((audio_data.shape[0],), dtype=audio_data.dtype)
+            preprocessed_pointer = 0
+
+            chunk_size = 10 * sample_rate # 10s of audio
+
+            if "filter-vocals" in librosa_preprocess:
+                chunk_begin = 0
+                in_chunks = []
+
+                while chunk_begin < audio_sample_count:
+                    in_chunks.append((chunk_begin, chunk_size, sample_rate))
+
+                    chunk_begin += chunk_size
+
+                for chunk in tqdm(p.imap(_preprocess_filter_vocals, in_chunks), desc="Filtering Vocals:", unit="chunks", total=len(in_chunks)):
+                    preprocessed_audio_buffer[preprocessed_pointer:preprocessed_pointer + chunk.shape[0]] = chunk * np.iinfo(preprocessed_audio_buffer.dtype).max
+                    preprocessed_pointer += chunk.shape[0]
+        else:
+            preprocessed_audio_buffer = audio_data
+    
+    # save to cache if not already
+    if enable_cache:
+        cache_file = _input_to_cache_filename(os.path.basename(input_file))
+
+        if not loaded_cached:
+            print(f"Caching preprocessed file \'{cache_file}\'")
+
+            sf.write(cache_dir + "/" + cache_file, preprocessed_audio_buffer, sample_rate)
 
     # Find frames with loud audio
     has_loud_audio = np.zeros(audio_frame_count, dtype=bool)
 
     if threshold_method == None:
-        threshold_method = "silence"
+        threshold_method = "volume"
 
     threshold_methods = {
-        "silence": 0,
+        "volume": 0,
         "webrtc-voice": 1
     }
 
@@ -329,7 +364,7 @@ def speed_up_video(
         try:
             import webrtcvad
         except ImportError:
-            print("Selected webrtc-voice as a threshold method without installing the required webrtcvad module!")
+            print("\033[93;40mWARNING\033[0m: Selected webrtc-voice as a threshold method without installing the required webrtcvad module!")
             quit(-1)
 
         webvad = webrtcvad.Vad(webrtc_mode)
@@ -348,7 +383,7 @@ def speed_up_video(
     for i in tqdm(range(audio_frame_count), desc="Thresholding audio:", unit='frames'):
         start = int(i * samples_per_frame)
         end = min(int((i + 1) * samples_per_frame), audio_sample_count)
-        audio_chunk = preprocessed_audio_buffer[start:end]
+        audio_chunk = preprocessed_audio_buffer[start:end].copy() # copy needed to break some ref chain to prevent copying the entire buffer into workers memory in the phasevocoding step (idk why it would tho???) 
 
         if threshold_index == 0: # silence method
             chunk_max_volume = float(_get_max_volume(audio_chunk)) / max_audio_volume
@@ -405,7 +440,9 @@ def speed_up_video(
     if enable_librosa:
         pass
 
-    sf.write(temp_folder + "/audioNew.wav", output_audio_data, sample_rate)
+    output_audio_data.resize((output_pointer, output_audio_data.shape[1]))
+
+    sf.write(temp_dir + "/audioNew.wav", output_audio_data, sample_rate)
 
     del output_audio_data
     del p
@@ -413,20 +450,19 @@ def speed_up_video(
     # Cut the video parts to length
     expression = _get_tree_expression(chunks)
 
-    filter_graph_file = open(temp_folder + "/filterGraph.txt", 'w')
+    filter_graph_file = open(temp_dir + "/filterGraph.txt", 'w')
     filter_graph_file.write(f'fps=fps={frame_rate},setpts=')
     filter_graph_file.write(expression.replace(',', '\\,'))
     filter_graph_file.close()
 
     command = [
         '-i', input_file,
-        '-i', temp_folder + '/audioNew.wav',
-        '-filter_script:v', temp_folder + '/filterGraph.txt',
+        '-i', temp_dir + '/audioNew.wav',
+        '-filter_script:v', temp_dir + '/filterGraph.txt',
         '-map', '0',
         '-map', '-0:a',
         '-map', '1:a',
         '-c:a', 'aac',
-        '-t', str(chunks[-1][3] / frame_rate), # fix incorrect video duration
         output_file,
         '-loglevel', 'warning',
         '-stats',
@@ -436,7 +472,7 @@ def speed_up_video(
 
     _run_timed_ffmpeg_command(command, total=chunks[-1][3], unit='frames', desc='Generating final:')
 
-    _delete_path(temp_folder)
+    _delete_path(temp_dir)
 
 
 if __name__ == '__main__':
@@ -452,6 +488,8 @@ if __name__ == '__main__':
     parser.add_argument('-j', '--jobs', type=int, dest='threads_num',
                         help="Number of threads used for phasevocoding the audio."
                         " By default equal to the number of hardware threads in your computer.")
+    parser.add_argument('-td', '--temp_dir', type=str, dest='temp_dir',
+                        help="Sets the directory used for temporary file storage while cutting. The directory is deleted after cutting is finished. Defaults to \"jump-temp\"")
 
     common_group = parser.add_argument_group('common audio options')
 
@@ -468,27 +506,36 @@ if __name__ == '__main__':
     common_group.add_argument('-fr', '--frame_rate', type=float, dest='frame_rate',
                         help="Frame rate of the input and output videos. FFmpeg tries to extract this information."
                              " Thus only needed if FFmpeg fails to do so.")
-    common_group.add_argument('-r', '--librosa', dest='enable_librosa', action='store_true',
-                        help="Enables advanced librosa based audio processing."
-                        " See the librosa help section for librosa specific options. (requires librosa module)")
     
     threshold_arguments = parser.add_argument_group('audio thresholding options')
 
     threshold_arguments.add_argument('-tm', '--threshold_method', type=str, dest='threshold_method',
                         help="Thresholding method used for determining if an audio is sounded or silent."
-                        " Currently support \"silence\" (default) and \"webrtc-voice\" (requires webrtcvad module) modes.")
+                        " Currently support \"volume\" (default) and \"webrtc-voice\" (requires webrtcvad module) modes.")
     threshold_arguments.add_argument('-t', '--silent_threshold', type=float, dest='silent_threshold',
                         help='The volume amount that frames\' audio needs to surpass to be consider "sounded".'
-                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03 (silence method only)')
+                             ' It ranges from 0 (silence) to 1 (max volume). Defaults to 0.03 (volume method only)')
     threshold_arguments.add_argument('-va', '--voice-aggressiveness-mode', type=int, dest='webrtc_mode',
                         help="Voice Activity Detection aggresiveness mode. Sets how aggresive is the voice detector about determining if a voice is present."
                         " Must be between 0 and 3. 0 is least aggresive about filtering non-speech, 3 is the most aggresive. Defaults to 1. (webrtc-voice method only)")
     
-    librosa_group = parser.add_argument_group('librosa options')
+    advanced_group = parser.add_argument_group('advanced options')
+    
+    advanced_group.add_argument('-r', '--librosa', dest='enable_librosa', action='store_true',
+                        help="Enables advanced librosa based audio processing."
+                        " See the librosa help section for librosa specific options. (requires librosa module)")
+    advanced_group.add_argument('-c', '--cache', dest='enable_cache', action='store_true',
+                        help="Enables caching of preprocessed audio tracks used for thresholding."
+                        " This is only useful for cases where librosa preprocessing takes a long while and you are still tweaking the settings."
+                        " NOTE: jumpcutter won't detect if you changed a setting that changes the preprocessed audio. If you do, you must delete the cached file for your changes to take effect.")
+    advanced_group.add_argument('-cd', '--cache_dir', type=str, dest='cache_dir',
+                        help="Sets the directory where jumpcutter stores its cached audio tracks. Default to \"jump-cache\"")
+
+    librosa_group = parser.add_argument_group('librosa options (will be ignored if librosa not enabled)')
 
     librosa_group.add_argument('-pre', '--pre_process', type=str, action='append', dest='librosa_preprocess',
                         help="Set what preprocessing stages are enabled before thresholding audio."
-                        " Currently supported stage is only \"filter-vocals\" and \"enhance-vocals\"")
+                        " Currently the only supported stage is \"filter-vocals\"")
 
     files = []
     for input_file in parser.parse_args().input_file:
