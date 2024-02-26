@@ -6,10 +6,13 @@ This fork is just a few optimalizations added to the already quite fast Gerell's
 Changes and additions:
 - Descresed Memory Usage by using an Shared Audio Buffers
 - Parallelized phasevocoding and fading
-- Voice Activity Detector (WebRTC) support for removing non-voice audio (must enable in flags)
+- Optional Voice Activity Detector (WebRTC) support for removing non-voice audio (must enable in flags)
+- Optional [librosa](https://librosa.org/) based audio preprocessing and filtering used for thresholding (eg. helpful for removing non-speech audio)
+  - built-in vocal filtering
+  - Preprocessed audio caching (must enable in flags but heavily recommended)
 
 May add in the future:
-- Smarter (and possibly slower) VAD which can separate and ignore background music and noise.
+- more preprocessing options for librosa
 
 ## Installing dependencies
 To install the python libaries this script depends on, simply run `pip install requirements.txt`.
